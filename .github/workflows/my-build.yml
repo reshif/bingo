@@ -1,0 +1,282 @@
+name: My build (Linux + Windows)
+
+# Personal build of Nod for Linux x64 (Flatpak) and Windows x64 (installer).
+# Runs on GitHub's free hosted runners. Builds are unsigned and are not
+# "release" builds, so they do not use n8n's signing keys, telemetry token
+# or update channel.
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the installers as a GitHub release in this repository
+        type: boolean
+        default: true
+  push:
+    branches: [claude/serene-ride-t3um00]
+    paths: [.github/workflows/my-build.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: my-build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '24.21.0'
+
+jobs:
+  version:
+    name: Pick version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - id: v
+        run: echo "version=$(node -p 'require("./desktop/package.json").version')" >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux x64 (Flatpak)
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      NOD_DESKTOP_TARGET: linux-x64
+      NOD_RUNTIME_REFRESH: local
+      NOD_DESKTOP_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Free disk space on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            desktop/pnpm-lock.yaml
+      - name: Install build tools and Flatpak runtimes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus flatpak flatpak-builder zstd
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user --noninteractive flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08 org.electronjs.Electron2.BaseApp//25.08
+      - name: Install locked dependencies
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir desktop install --frozen-lockfile
+      - run: echo "NOD_RELEASE_SOURCE=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+      - name: Build the workspace image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: Dockerfile.workspace
+          platforms: linux/amd64
+          load: true
+          build-args: NOD_RUNTIME_REFRESH=${{ env.NOD_RUNTIME_REFRESH }}
+          tags: nod-desktop-workspace:experiment
+      - name: Build the browser image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: Dockerfile.browser
+          platforms: linux/amd64
+          load: true
+          build-args: NOD_RUNTIME_REFRESH=${{ env.NOD_RUNTIME_REFRESH }}
+          tags: nod-desktop-browser:experiment
+      - name: Build the app and its runtime
+        run: |
+          pnpm run build
+          node desktop/scripts/prepare-runtime.mjs --prebuilt-images
+          docker image prune --all --force || true
+      - name: Package the Linux app
+        run: pnpm run desktop:linux:build
+      - name: Build and install the Flatpak bundle
+        run: |
+          flatpak-builder --user --force-clean --default-branch=stable --repo=.local/flatpak-repo .local/flatpak-build desktop/flatpak/io.n8n.Nod.yml
+          rm -rf .local/flatpak-build
+          flatpak build-bundle --arch=x86_64 --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo .local/flatpak-repo .local/nod-linux-x64.flatpak io.n8n.Nod stable
+          flatpak install --user --noninteractive --no-deps .local/nod-linux-x64.flatpak
+      - name: Smoke-test the installed engine inside Flatpak
+        run: |
+          dbus-run-session -- flatpak run --env=ELECTRON_RUN_AS_NODE=1 --command=sh io.n8n.Nod -c 'cd /app/nod/resources/engine && exec "$@"' nod-check /app/nod/nod --input-type=module -e '
+            const { register } = await import("tsx/esm/api");
+            register();
+            await import("./src/server/composition.ts");
+            const { pool } = await import("./src/server/db.ts");
+            await pool.end();
+          '
+      - name: Split into release-sized parts (GitHub allows 2 GB per file)
+        run: |
+          NOD_FLATPAK_COMMIT="$(flatpak info --user --show-commit io.n8n.Nod)"
+          export NOD_FLATPAK_COMMIT
+          node desktop/scripts/linux-release.mjs
+          ls -la dist/desktop/linux-x64/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: nod-linux-x64
+          path: |
+            dist/desktop/linux-x64/SHA256SUMS-linux-x64
+            dist/desktop/linux-x64/nod-linux-x64.flatpak.part*
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+  windows-runtime:
+    name: Windows runtime (built on Linux)
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      NOD_RUNTIME_ASSETS: .local/windows-runtime-assets
+      NOD_RUNTIME_REFRESH: local
+      NOD_DESKTOP_TARGET: win32-x64
+    steps:
+      - name: Free disk space on the runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          sudo docker image prune --all --force || true
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build the workspace image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: Dockerfile.workspace
+          platforms: linux/amd64
+          load: true
+          build-args: NOD_RUNTIME_REFRESH=${{ env.NOD_RUNTIME_REFRESH }}
+          tags: nod-desktop-workspace:experiment
+      - name: Build the browser image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc
+        with:
+          context: .
+          file: Dockerfile.browser
+          platforms: linux/amd64
+          load: true
+          build-args: NOD_RUNTIME_REFRESH=${{ env.NOD_RUNTIME_REFRESH }}
+          tags: nod-desktop-browser:experiment
+      - name: Export the native images
+        run: node desktop/scripts/prepare-runtime.mjs --images-only --prebuilt-images
+      - name: Build the Windows root filesystem
+        run: node desktop/scripts/prepare-windows-runtime.mjs --prebuilt-images
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-runtime
+          path: |
+            .local/windows-runtime-assets/guest.tar.gz
+            .local/windows-runtime-assets/manifest.json
+            .local/windows-runtime-assets/runtime-win32-x64-*.json
+          include-hidden-files: true
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  windows:
+    name: Windows x64 installer
+    needs: [version, windows-runtime]
+    runs-on: windows-2025
+    timeout-minutes: 120
+    env:
+      NOD_DESKTOP_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - run: |
+          pnpm install --frozen-lockfile
+          pnpm --dir desktop install --frozen-lockfile
+          choco install nsis --yes --no-progress
+      - name: Download verified Windows Electron
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node desktop/scripts/prepare-windows-electron.mjs
+      - run: pnpm run build
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: windows-runtime
+          path: .local/windows-runtime-assets
+      - name: Package the Windows installer
+        run: node desktop/scripts/build-windows.mjs
+      - name: Check the installer
+        run: node desktop/scripts/check-windows.mjs
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: nod-windows-x64
+          path: |
+            dist/windows/nod-Setup-x64.exe
+            dist/windows/nod-Runtime-win32-x64.tar.gz
+            dist/windows/SHA256SUMS
+          compression-level: 0
+          retention-days: 14
+          if-no-files-found: error
+
+  publish:
+    name: Publish release
+    needs: [version, linux, windows]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          path: out
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          ls -la out
+          mv out/SHA256SUMS out/SHA256SUMS-windows-x64
+          tag="my-v${VERSION}-build${GITHUB_RUN_NUMBER}"
+          cat > notes.md <<'EOF'
+          Personal unsigned build of Nod.
+
+          **Windows:** download `nod-Setup-x64.exe` and run it. Windows SmartScreen will warn because the build is unsigned: click *More info → Run anyway*.
+
+          **Linux (Ubuntu, Fedora, …):** download every `nod-linux-x64.flatpak.part*` file, then:
+
+          ```bash
+          cat nod-linux-x64.flatpak.part* > nod-linux-x64.flatpak
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user nod-linux-x64.flatpak
+          flatpak run io.n8n.Nod
+          ```
+          EOF
+          gh release create "$tag" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "My Nod ${VERSION} (build ${GITHUB_RUN_NUMBER})" \
+            --notes-file notes.md \
+            --prerelease
